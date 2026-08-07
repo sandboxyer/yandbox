@@ -39,6 +39,7 @@ class YandBox {
         this.activeConfigName = config.activeConfig || saved.activeConfig || null;
         this.totalCost = saved.totalCost || 0;
         this.sessionCost = 0;
+        this.sessionContinueCost = 0;            // NEW: track cost from continuation attempts
         this.requests = saved.requests || [];
         this.versions = [];
         this.currentGeneration = null;
@@ -183,9 +184,15 @@ class YandBox {
                 ['Port', '\x1b[34m' + this.port + '\x1b[0m'],
                 ['Requests', '\x1b[35m' + this.requestCount + '\x1b[0m'],
                 ['Session Cost', '\x1b[31m$' + this.sessionCost.toFixed(8) + '\x1b[0m'],
-                ['Total Cost', '\x1b[31m$' + this.totalCost.toFixed(8) + '\x1b[0m'],
-                ['Generation', this.currentGeneration ? '\x1b[33mACTIVE\x1b[0m' : '\x1b[90midle\x1b[0m']
             ];
+            
+            // Show continue cost separately if non‑zero
+            if (this.sessionContinueCost > 0) {
+                lines.push(['Continue Cost', '\x1b[31m$' + this.sessionContinueCost.toFixed(8) + '\x1b[0m']);
+            }
+            
+            lines.push(['Total Cost', '\x1b[31m$' + this.totalCost.toFixed(8) + '\x1b[0m']);
+            lines.push(['Generation', this.currentGeneration ? '\x1b[33mACTIVE\x1b[0m' : '\x1b[90midle\x1b[0m']);
             
             if (this.provider === 'local') {
                 lines.splice(2, 0, ['Server', '\x1b[34m' + (this.serverUrl || 'localhost') + ':' + (this.serverPort || 4000) + '\x1b[0m']);
@@ -423,42 +430,167 @@ class YandBox {
         }
     }
 
+    // ---------- NEW: HTML completeness checker ----------
     /**
-     * Calculate progress percentage using multiple factors
-     * @param {number} generatedLength - Current length of generated buffer
-     * @param {number} estimatedTotal - Estimated total output length
-     * @param {Object} structure - HTML structure markers { tags, closingTags }
-     * @param {number} elapsedSeconds - Time elapsed since generation started
-     * @returns {number} Progress percentage (0-95)
+     * Check if the generated HTML is structurally complete.
+     * Uses a stack-based parser ignoring void/self-closing elements,
+     * script/style blocks and comments.
      */
-    _calculateProgress(generatedLength, estimatedTotal, structure, elapsedSeconds) {
-        // Factor 1: Character-based progress (capped at 80%)
-        const charProgress = Math.min(80, (generatedLength / Math.max(estimatedTotal, 1)) * 100);
+    _isHtmlComplete(html) {
+        // Remove script and style blocks
+        let clean = html.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '');
+        clean = clean.replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, '');
+        // Remove HTML comments
+        clean = clean.replace(/<!--[\s\S]*?-->/g, '');
         
-        // Factor 2: Structure-based progress (HTML tag completeness, up to 10%)
+        const voidElements = new Set([
+            'area','base','br','col','embed','hr','img','input',
+            'link','meta','param','source','track','wbr','command',
+            'keygen','menuitem'
+        ]);
+        
+        const tagRegex = /<\/?([a-zA-Z0-9]+)(\s[^>]*)?>/g;
+        const stack = [];
+        let match;
+        
+        while ((match = tagRegex.exec(clean)) !== null) {
+            const fullTag = match[0];
+            const tagName = match[1].toLowerCase();
+            const isClosing = fullTag.startsWith('</');
+            const isSelfClosing = fullTag.endsWith('/>');
+            
+            if (isClosing) {
+                if (stack.length === 0) return false;
+                const last = stack.pop();
+                if (last !== tagName) return false;
+            } else if (voidElements.has(tagName) || isSelfClosing) {
+                // void or self-closing, ignore
+            } else {
+                stack.push(tagName);
+            }
+        }
+        
+        return stack.length === 0;
+    }
+
+    // ---------- NEW: Core generation method (used by main & continues) ----------
+    /**
+     * Runs a single AI chat completion and returns the generated HTML buffer
+     * plus metadata for cost calculation. Handles streaming, progress updates,
+     * and works within the existing abort controller.
+     */
+    async _callAIForGeneration(messages, chatRes, estimatedOutputLength) {
+        const generationStartTime = Date.now();
+        let generatedBuffer = '';
+        const htmlStructure = { tags: 0, closingTags: 0 };
+        
+        const chatConfig = {
+            stream: true,
+            tokenCallback: (data) => {
+                let token = null;
+                if (data.stream?.content) {
+                    token = data.stream.content;
+                } else if (data.content) {
+                    token = data.content;
+                } else if (data.choices?.[0]?.delta?.content) {
+                    token = data.choices[0].delta.content;
+                } else if (data.choices?.[0]?.text) {
+                    token = data.choices[0].text;
+                } else if (typeof data === 'string') {
+                    token = data;
+                }
+                
+                if (token) {
+                    generatedBuffer += token;
+                    if (token.includes('<')) htmlStructure.tags++;
+                    if (token.includes('</')) htmlStructure.closingTags++;
+                    
+                    const elapsedSeconds = (Date.now() - generationStartTime) / 1000;
+                    const percent = this._calculateProgress(
+                        generatedBuffer.length, 
+                        estimatedOutputLength, 
+                        htmlStructure, 
+                        elapsedSeconds
+                    );
+                    this._sendProgress(percent);
+                }
+            }
+        };
+
+        if (this.provider === 'deepseek') chatConfig.deepseek = true;
+        else if (this.provider === 'deepinfra') chatConfig.deepinfra = true;
+
+        const result = await this.AI.Chat(messages, chatConfig);
+
+        // Extract buffer if streaming didn't capture (fallback)
+        if (!generatedBuffer && result) {
+            if (result.full_text) generatedBuffer = result.full_text;
+            else if (result.choices?.[0]?.message?.content) generatedBuffer = result.choices[0].message.content;
+            else if (typeof result === 'string') generatedBuffer = result;
+        }
+
+        return {
+            buffer: generatedBuffer || '',
+            usage: result.metadata?.usage,
+            model: result.metadata?.model || this.model
+        };
+    }
+
+    // ---------- NEW: Centralised cost recording ----------
+    /**
+     * Record a single generation request (normal or continuation) and update
+     * session/total/continue cost counters.
+     */
+    _recordRequest(usage, model, isContinue = false) {
+        if (!usage) {
+            // Fallback for providers that don't return usage (e.g. local)
+            this.requestCount++;
+            return;
+        }
+
+        const tokens = (usage.prompt_tokens || 0) + (usage.completion_tokens || 0);
+        let cost = 0;
+        
+        // Prefer estimated_cost (works for all providers)
+        if (usage.estimated_cost !== undefined && usage.estimated_cost !== null) {
+            cost = usage.estimated_cost;
+        } else if (this.provider === 'deepseek' && this.AI.DeepSeek) {
+            cost = this.AI.DeepSeek._calculateCost(this.model, usage);
+        } else if (this.provider === 'deepinfra' && this.AI.DeepInfra) {
+            cost = this.AI.DeepInfra._calculateCost(this.model, usage);
+        }
+        
+        if (tokens > 0 || cost > 0) {
+            this.sessionCost += cost;
+            this.totalCost += cost;
+            if (isContinue) {
+                this.sessionContinueCost += cost;
+            }
+            this.requests.push({
+                model: model || this.model || this.provider,
+                cost,
+                tokens,
+                time: new Date().toLocaleTimeString()
+            });
+        }
+        this.requestCount++;
+    }
+
+    // Progress helpers (unchanged)
+    _calculateProgress(generatedLength, estimatedTotal, structure, elapsedSeconds) {
+        const charProgress = Math.min(80, (generatedLength / Math.max(estimatedTotal, 1)) * 100);
         let structureProgress = 0;
         if (structure.tags > 0) {
             const closingRatio = structure.closingTags / structure.tags;
             structureProgress = Math.min(10, closingRatio * 10);
         }
-        
-        // Factor 3: Time-based progress for slow generations (up to 5%)
         const timeProgress = Math.min(5, elapsedSeconds * 1.5);
-        
-        // Combine factors, max 95% (reserve 100% for completion signal)
         return Math.min(95, Math.round(charProgress + structureProgress + timeProgress));
     }
 
-    /**
-     * Send progress update with rate limiting
-     * @param {number} percent - Progress percentage to broadcast
-     * @param {boolean} force - Force send regardless of rate limit
-     */
     _sendProgress(percent, force = false) {
         const now = Date.now();
         const state = this._progressState;
-        
-        // Only send if progress changed or enough time passed (250ms minimum between updates)
         if (force || percent !== state.lastPercent || (now - state.lastUpdateTime) >= 250) {
             state.lastPercent = percent;
             state.lastUpdateTime = now;
@@ -466,9 +598,6 @@ class YandBox {
         }
     }
 
-    /**
-     * Reset progress tracking state
-     */
     _resetProgress() {
         this._progressState = {
             lastPercent: 0,
@@ -512,7 +641,6 @@ class YandBox {
     let eventSource = null;
     let progressReceived = false;
     
-    // Fetch previous versions
     fetch('/api/versions')
       .then(r => r.json())
       .then(versions => {
@@ -639,6 +767,7 @@ class YandBox {
         this.broadcastSSE({ type: 'update-html', html: versionHtml });
     }
 
+    // ---------- MODIFIED: startGeneration with auto‑continue ----------
     async startGeneration(message, chatRes) {
         let currentHtml;
         try {
@@ -647,9 +776,7 @@ class YandBox {
             currentHtml = '<html><body></body></html>';
         }
         
-        // Estimate output length based on input size with minimum threshold
         const estimatedOutputLength = Math.max(currentHtml.length, 500);
-
         const abortController = new AbortController();
         this.currentGeneration = {
             abortController,
@@ -658,14 +785,11 @@ class YandBox {
             message
         };
 
-        // Reset progress state for new generation
         this._resetProgress();
         this._progressState.isActive = true;
 
         const loadingHtml = this.getLoadingTemplate(0);
         this.broadcastSSE({ type: 'update-html', html: loadingHtml });
-        
-        // Send initial progress explicitly
         this._sendProgress(0, true);
 
         const originalFetch = globalThis.fetch;
@@ -676,168 +800,63 @@ class YandBox {
             return originalFetch(url, options);
         };
 
+        // Send initial chat message
+        chatRes.write(`data: ${JSON.stringify({ type: 'token', token: '🔄 Generating new page...' })}\n\n`);
+
+        const systemPrompt = `You are an expert web developer. The user wants to modify the HTML page. Provide the complete new HTML code. Output ONLY the raw HTML without markdown fences or explanations. Ensure the HTML is valid and includes all necessary tags.`;
+        
         try {
-            const systemPrompt = `You are an expert web developer. The user wants to modify the HTML page. Provide the complete new HTML code. Output ONLY the raw HTML without markdown fences or explanations. Ensure the HTML is valid and includes all necessary tags.`;
-            const userPrompt = `Current HTML:\n${currentHtml}\n\nUser request: ${message}\n\nNew HTML:`;
+            let finalHtml = '';
+            let attempts = 0;
+            const maxContinues = 12;   // default limit, can be made configurable later
+            let baseHtml = currentHtml;
             
-            const messages = [
+            // Helper to build messages for the current base HTML
+            const buildMessages = (html) => [
                 { role: 'system', content: systemPrompt },
-                { role: 'user', content: userPrompt }
+                { role: 'user', content: `Current HTML:\n${html}\n\nUser request: ${message}\n\nNew HTML:` }
             ];
 
-            let generatedBuffer = '';
-            let tokenCount = 0;
-            const generationStartTime = Date.now();
-            
-            // Track HTML structure for more accurate progress
-            const htmlStructure = {
-                tags: 0,
-                closingTags: 0
-            };
-
-            const chatConfig = {
-                stream: true,
-                tokenCallback: (data) => {
-                    let token = null;
-                    
-                    // Handle various response formats from different providers
-                    if (data.stream?.content) {
-                        token = data.stream.content;
-                    } else if (data.content) {
-                        token = data.content;
-                    } else if (data.choices?.[0]?.delta?.content) {
-                        token = data.choices[0].delta.content;
-                    } else if (data.choices?.[0]?.text) {
-                        token = data.choices[0].text;
-                    } else if (typeof data === 'string') {
-                        token = data;
-                    }
-                    
-                    if (token) {
-                        generatedBuffer += token;
-                        tokenCount++;
-                        
-                        // Track HTML structure for progress estimation
-                        if (token.includes('<')) htmlStructure.tags++;
-                        if (token.includes('</')) htmlStructure.closingTags++;
-                        
-                        // Calculate progress
-                        const elapsedSeconds = (Date.now() - generationStartTime) / 1000;
-                        const percent = this._calculateProgress(
-                            generatedBuffer.length, 
-                            estimatedOutputLength, 
-                            htmlStructure, 
-                            elapsedSeconds
-                        );
-                        
-                        this._sendProgress(percent);
-                    }
-                }
-            };
-
-            // Set provider flags
-            if (this.provider === 'deepseek') {
-                chatConfig.deepseek = true;
-            } else if (this.provider === 'deepinfra') {
-                chatConfig.deepinfra = true;
-            }
-            // Local provider: no flag needed, EasyAI routes via server_url
-
-            const result = await this.AI.Chat(messages, chatConfig);
-
-            // If streaming didn't capture content, extract from result
-            if (!generatedBuffer && result) {
-                if (result.full_text) {
-                    generatedBuffer = result.full_text;
-                } else if (result.choices?.[0]?.message?.content) {
-                    generatedBuffer = result.choices[0].message.content;
-                } else if (typeof result === 'string') {
-                    generatedBuffer = result;
-                }
-            }
-
-            // Send 100% progress
+            // First generation pass
+            let passResult = await this._callAIForGeneration(
+                buildMessages(baseHtml), chatRes, estimatedOutputLength
+            );
+            finalHtml = this._cleanHtml(passResult.buffer);
+            this._recordRequest(passResult.usage, passResult.model, false);
             this._sendProgress(100, true);
-            
-            // Small delay for visual completion effect
-            await new Promise(resolve => setTimeout(resolve, 150));
 
-            // Clean and extract HTML
-            let finalHtml = (generatedBuffer || '').trim();
-            
-            // Remove markdown code fences
-            finalHtml = finalHtml.replace(/^```html\s*\n?/i, '');
-            finalHtml = finalHtml.replace(/\n?```\s*$/i, '');
-            finalHtml = finalHtml.replace(/^```\s*\n?/i, '');
-            finalHtml = finalHtml.replace(/\n?```\s*$/i, '');
-            
-            if (!finalHtml || finalHtml.length < 20) {
-                throw new Error('Generated content is empty or too short');
+            // Continue if HTML incomplete
+            while (!this._isHtmlComplete(finalHtml) && attempts < maxContinues) {
+                attempts++;
+                // Inform user via chat SSE
+                chatRes.write(`data: ${JSON.stringify({ type: 'token', token: `🔄 HTML incomplete – continuing (attempt ${attempts})...` })}\n\n`);
+                
+                baseHtml = finalHtml;   // use current (incomplete) result as new base
+                passResult = await this._callAIForGeneration(
+                    buildMessages(baseHtml), chatRes, estimatedOutputLength
+                );
+                finalHtml = this._cleanHtml(passResult.buffer);
+                this._recordRequest(passResult.usage, passResult.model, true);  // mark as continue cost
+                this._sendProgress(100, true);
             }
 
-            // Save the new main.html
+            // Final save & broadcast
             writeFileSync('./main.html', finalHtml, 'utf8');
-
-            // Add version to history
             this.versions.push({
                 timestamp: new Date().toLocaleString(),
                 request: message,
                 html: finalHtml
             });
             this.saveVersions();
-
-            // Broadcast final update
             this.broadcastSSE({ type: 'update-html', html: finalHtml });
 
-            // Send success to chat
+            // Success message
             if (!chatRes.writableEnded) {
                 chatRes.write(`data: ${JSON.stringify({ type: 'token', token: '✅ Page updated successfully!' })}\n\n`);
                 chatRes.write('data: {"type":"end"}\n\n');
                 chatRes.end();
             }
 
-            // Update request stats
-            this.requestCount++;
-            
-            // Cost calculation using result.metadata
-            if (result.metadata?.usage) {
-                const usage = result.metadata.usage;
-                const tokens = (usage.prompt_tokens || 0) + (usage.completion_tokens || 0);
-                let cost = 0;
-                
-                // Use estimated_cost if available (works for all providers)
-                if (usage.estimated_cost !== undefined && usage.estimated_cost !== null) {
-                    cost = usage.estimated_cost;
-                }
-                // Fallback for DeepSeek
-                else if (this.provider === 'deepseek' && this.AI.DeepSeek) {
-                    cost = this.AI.DeepSeek._calculateCost(this.model, usage);
-                }
-                // Fallback for DeepInfra
-                else if (this.provider === 'deepinfra' && this.AI.DeepInfra) {
-                    cost = this.AI.DeepInfra._calculateCost(this.model, usage);
-                }
-                
-                if (tokens > 0 || cost > 0) {
-                    this.sessionCost += cost;
-                    this.totalCost += cost;
-                    this.requests.push({
-                        model: result.metadata.model || this.model || this.provider,
-                        cost,
-                        tokens,
-                        time: new Date().toLocaleTimeString()
-                    });
-                }
-            } else if (this.provider === 'local') {
-                // Local provider - no cost
-                this.requests.push({
-                    model: this.model || 'local-model',
-                    cost: 0,
-                    tokens: tokenCount,
-                    time: new Date().toLocaleTimeString()
-                });
-            }
-            
             this.saveConfig();
 
         } catch (error) {
@@ -861,6 +880,16 @@ class YandBox {
             this.currentGeneration = null;
             this._resetProgress();
         }
+    }
+
+    // Helper to strip markdown fences from generated text
+    _cleanHtml(text) {
+        let out = text.trim();
+        out = out.replace(/^```html\s*\n?/i, '');
+        out = out.replace(/\n?```\s*$/i, '');
+        out = out.replace(/^```\s*\n?/i, '');
+        out = out.replace(/\n?```\s*$/i, '');
+        return out;
     }
 
     async handleChatMessage(req, res) {
@@ -896,8 +925,6 @@ class YandBox {
                     'Connection': 'keep-alive'
                 });
 
-                res.write(`data: ${JSON.stringify({ type: 'token', token: '🔄 Generating new page...' })}\n\n`);
-                
                 this.startGeneration(message, res);
 
             } catch (error) {
@@ -913,7 +940,7 @@ class YandBox {
     }
 }
 
-// ---------- CLI helpers ----------
+// ---------- CLI helpers (unchanged) ----------
 async function question(q) {
     const rl = readline.createInterface({
         input: process.stdin,
@@ -1133,7 +1160,7 @@ async function manageKeys() {
         
         saved.configs = configs;
         writeFileSync(tokenPath, JSON.stringify(saved, null, 2));
-        console.log('\x1b[32m✓ Model updated!\x1b[0m');
+        console.log('\n\x1b[32m✓ Model updated!\x1b[0m');
         return true;
         
     } else if (action === 'd' && configNames.length > 0) {
@@ -1145,7 +1172,7 @@ async function manageKeys() {
                 saved.activeConfig = Object.keys(configs)[0] || null;
             }
             writeFileSync(tokenPath, JSON.stringify(saved, null, 2));
-            console.log('\x1b[32m✓ Configuration deleted!\x1b[0m');
+            console.log('\n\x1b[32m✓ Configuration deleted!\x1b[0m');
         } else {
             console.log('\x1b[31m✗ Configuration not found\x1b[0m');
         }
